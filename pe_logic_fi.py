@@ -1,55 +1,34 @@
+from dataclasses import dataclass
+from pathlib import Path
+
 import numpy as np
-from kyupy import verilog, Timers, logic_sim
+from tqdm import tqdm
+
+from kyupy import log, cdiv, verilog, Timers, logic_sim
 from kyupy.logic import unpackbits, packbits
 from kyupy.techlib import SAED90
-from tqdm import tqdm
-import os
-
 
 class FMAlogic(logic_sim.LogicSim):
-    def __init__(self, netlist_path, sims=1024):
-        print(f"\n📦 加载网表: {netlist_path}")
-        circuit = verilog.load(netlist_path, tlib=SAED90)
-        circuit.resolve_tlib_cells(SAED90)
+    def __init__(self, circuit, sims=1024):
         super().__init__(circuit, sims, m=2, c_reuse=False, strip_forks=False)
 
         self.circuit = circuit
         self.timers = Timers()
 
-        self.a_locs = self._get_locs('activation_reg')
-        self.b_locs = self._get_locs('weight_reg')
-        self.s_locs = self._get_locs('i_sum')
-        self.r_locs = self._get_locs('o_sum_reg')
+        self.a_locs = self.circuit.s_locs('activation_reg')
+        self.b_locs = self.circuit.s_locs('weight_reg')
+        self.s_locs = self.circuit.s_locs('i_sum')
+        self.r_locs = self.circuit.s_locs('o_sum_reg')
 
-        print("\n🔍 关键寄存器位置:")
-        print(f"activation_reg: {self.a_locs}")
-        print(f"weight_reg: {self.b_locs}")
-        print(f"i_sum: {self.s_locs}")
-        print(f"o_sum_reg: {self.r_locs}")
-
-        self.candidate_nodes = self._get_candidate_nodes()
-        print(f"\n✅ 候选故障点数量: {len(self.candidate_nodes)}")
-        print(f"前5个候选故障点: {self.candidate_nodes[:5]}")
-
-    def _get_locs(self, name):
-        try:
-            return self.circuit.s_locs(name)
-        except:
-            return []
-
-    def _get_candidate_nodes(self):
-        nodes = []
-        for inst in self.circuit.instances:
-            if inst.is_cell:
-                for pin in inst.pins:
-                    if pin.direction in ["output", "out"] and pin.net:
-                        nodes.append(pin.net.index)
-        return list(set(nodes))
+        assert len(self.a_locs) == 8
+        assert len(self.b_locs) == 8
+        assert len(self.s_locs) == 24
+        assert len(self.r_locs) == 24
 
     def sim(self, a, b, s, fault=None):
         shape = a.shape
         a, b, s = a.astype(np.int8), b.astype(np.int8), s.astype(np.int32)
-        nbytes = int(np.ceil(len(a)/8))
+        nbytes = cdiv(len(a), 8)
 
         self.s[0, self.a_locs, 0, :nbytes] = np.packbits(unpackbits(a).T, axis=-1)
         self.s[0, self.b_locs, 0, :nbytes] = np.packbits(unpackbits(b).T, axis=-1)
@@ -57,53 +36,65 @@ class FMAlogic(logic_sim.LogicSim):
 
         self.s_to_c()
 
-        if fault:
-            fault_node, fault_val = fault
-            self.c[0, fault_node, 0, :] = 0xFF if fault_val == 1 else 0x00
-            print(f"⚡ 注入故障: 节点 {fault_node} stuck-at-{fault_val}")
+        def make_fault_injector(fault_site, fault_value):
+            def fi(line, data):
+                if line == fault_site:
+                    data[0] = 255 if fault_value else 0
+            return fi
 
-        self.c_prop()
+        self.c_prop(inject_cb=make_fault_injector(*fault) if fault else None)
         self.c_to_s()
         r_bits = np.unpackbits(self.s[1, self.r_locs, 0, :nbytes], axis=-1).T
         return packbits(r_bits, dtype=np.int32)[:len(a)].reshape(shape)
 
+def collect_fault_sites(circuit):
+    '''fault site: output of a gate.
+    TODO: Proper stuck-at fault collapsing'''
+    fault_sites = set()
+    for n in circuit.topological_order():
+        if n.kind == '__fork__': continue
+        fault_sites |= set(n.outs)
+    return [line.index for line in fault_sites if line is not None]
+
+
+@dataclass
+class FaultStat:
+    fault_site: int
+    fault_value: int
+    failed_tests: int
+    rmse: float
+
 
 if __name__ == '__main__':
-    print("="*55)
-    print("🚀 启动门级故障注入评估框架")
-    print("="*55)
+    netlist_path = Path('synthesized', 'pe.saed90.v')
+    log.info(f"Loading {netlist_path}")
+    circuit = verilog.load(netlist_path, tlib=SAED90)
+    log.info(f'Lines: {len(circuit.lines)} Cells: {len(circuit.cells)}')
+    fault_sites = collect_fault_sites(circuit)
+    log.info(f'FaultSites: {len(fault_sites)}')
+    circuit.resolve_tlib_cells(SAED90)
+    fma = FMAlogic(circuit, sims=1024)
+    log.info(f'Tests: {fma.sims}')
 
-    netlist_path = os.path.join(os.path.dirname(__file__), 'hw', 'pe.synth_dct.v.gz')
-    fma = FMAlogic(netlist_path, sims=1024)
-
-    # 生成输入向量
     rng = np.random.default_rng(42)
     a = rng.integers(-128, 127, fma.sims)
     b = rng.integers(-128, 127, fma.sims)
     s = rng.integers(-2**20, 2**20, fma.sims)
 
-    # 运行无故障仿真
     golden = fma.sim(a, b, s)
-    print(f"无故障输出样例: {golden[:5]}")
+    log.info(f"golden simulation finished {golden[:5]}")
 
-    # 故障注入评估
-    results = []
-    print("\n🚀 开始故障注入与RMSE评估...")
-    for node in tqdm(fma.candidate_nodes[:10]):
-        rmse_vals = []
-        for stuck in [0, 1]:
-            faulty_out = fma.sim(a, b, s, fault=(node, stuck))
-            rmse = np.sqrt(np.mean((golden - faulty_out) ** 2))
-            rmse_vals.append(rmse)
-            print(f"📊 节点 {node} SA{stuck} RMSE={rmse:.4f}")
-        results.append((node, *rmse_vals))
+    faults_stats: list[FaultStat] = []
+    log.info("fault injection")
+    for fault_site in tqdm(fault_sites):
+        for fault_value in [0, 1]:
+            syndrome = fma.sim(a, b, s, fault=(fault_site, fault_value))
+            failed_tests = np.sum(syndrome != golden)
+            rmse = np.sqrt(np.mean((syndrome.astype(float) - golden.astype(float)) ** 2))
+            faults_stats.append(FaultStat(fault_site, fault_value, failed_tests, rmse))
 
-    # 选出关键故障点
-    results.sort(key=lambda x: max(x[1], x[2]), reverse=True)
-    print("\n📌 Top 10 RMSE Faults:")
-    for node, r0, r1 in results[:10]:
-        print(f"节点 {node}: SA0={r0:.4f}, SA1={r1:.4f}")
-
-    FS = [node for node, r0, r1 in results if max(r0, r1) > 100.0]  # 可调阈值
-    print("\n✅ 最终关键 Fault Set (FS):")
-    print(FS)
+    faults_stats.sort(key=lambda x: x.rmse, reverse=True)
+    log.info(f'Fault coverage: {sum([fstat.failed_tests > 0 for fstat in faults_stats])/len(faults_stats)*100:.2f}%')
+    log.info("Faults with Top 10 RMSE:")
+    for fstat in faults_stats[:10]:
+        log.info(f"  {fstat.fault_site} SA-{fstat.fault_value} failed_tests {fstat.failed_tests} rmse {fstat.rmse:.4f}")
