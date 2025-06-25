@@ -98,3 +98,7 @@ if __name__ == '__main__':
     log.info("Faults with Top 10 RMSE:")
     for fstat in faults_stats[:10]:
         log.info(f"  {fstat.fault_site} SA-{fstat.fault_value} failed_tests {fstat.failed_tests} rmse {fstat.rmse:.4f}")
+    log.info('Critical faults by threshold:')
+    for threshold in range(100):
+        critical_fault_count = sum([fstat.rmse > threshold for fstat in faults_stats])
+        print(f'{threshold}\t{critical_fault_count}\t{critical_fault_count/len(faults_stats)*100:.2f}%')
